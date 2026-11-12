@@ -1,10 +1,12 @@
-"""FastAPI 入口：公告采集 API。
+"""FastAPI 入口：公告采集 + 附件可用性检查 API。
 
 端点：
-* GET  /                 演示页（可直接在浏览器发起采集）
-* POST /api/v1/collect   传入列表页 URL 与项目编号，返回合并后的投标状态
-* GET  /api/v1/collect   同上的查询参数形式，便于浏览器/curl 快速演示
-* GET  /healthz          健康检查
+* GET  /                            演示页（可直接在浏览器发起采集/附件检查）
+* POST /api/v1/collect              传入列表页 URL 与项目编号，返回合并后的投标状态
+* GET  /api/v1/collect              同上的查询参数形式，便于浏览器/curl 快速演示
+* POST /api/v1/attachments/check    检查该项目公告引用的本站 PDF/ZIP 附件是否可下载
+* GET  /api/v1/attachments/check    同上的查询参数形式
+* GET  /healthz                     健康检查
 """
 
 from __future__ import annotations
@@ -12,13 +14,15 @@ from __future__ import annotations
 from fastapi import FastAPI, Query
 from fastapi.responses import HTMLResponse
 
+from app.attachments import check_attachments
 from app.collector import collect
-from app.models import FetchRequest, FetchResponse
+from app.models import AttachmentCheckRequest, AttachmentCheckResponse, FetchRequest, FetchResponse
 
 app = FastAPI(
     title="采购公告采集 API",
-    description="抓取同站点原公告与更正公告，按发布时间合并，输出投标状态与有效截止时间。",
-    version="1.0.0",
+    description="抓取同站点原公告与更正公告，按发布时间合并，输出投标状态与有效截止时间；"
+    "并可检查公告引用的本站附件是否真实可下载。",
+    version="1.1.0",
 )
 
 
@@ -37,11 +41,13 @@ pre { background: #f4f4f6; padding: 1rem; border-radius: 8px; overflow:auto; max
 </head>
 <body>
 <h1>采购公告采集 API 演示</h1>
-<p class="hint">示例站点由 docker compose 中的 nginx 提供，默认地址 <code>http://localhost:8080/list.html</code></p>
+<p class="hint">示例站点由 docker compose 中的 nginx 提供，默认地址 <code>http://localhost:8080/list.html</code>；
+若 API 运行在 compose 网络内，请改用 <code>http://sample-site/list.html</code></p>
 <form id="f">
   <p><label>列表页 URL <input id="list_url" value="http://localhost:8080/list.html"></label></p>
   <p><label>项目编号 <input id="project_code" value="GSB-2026-001"></label></p>
-  <button type="submit">采集并合并</button>
+  <button type="submit" data-endpoint="/api/v1/collect">采集并合并</button>
+  <button type="submit" data-endpoint="/api/v1/attachments/check">检查附件可用性</button>
 </form>
 <pre id="out">响应将显示在这里……</pre>
 <script>
@@ -54,7 +60,7 @@ document.getElementById('f').addEventListener('submit', async (e) => {
     project_code: document.getElementById('project_code').value
   };
   try {
-    const resp = await fetch('/api/v1/collect', {
+    const resp = await fetch(e.submitter.dataset.endpoint, {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
       body: JSON.stringify(payload)
@@ -91,3 +97,19 @@ async def collect_get(
     timeout: float = Query(10.0, ge=1.0, le=60.0),
 ) -> FetchResponse:
     return await collect(FetchRequest(list_url=list_url, project_code=project_code, timeout=timeout))
+
+
+@app.post("/api/v1/attachments/check", response_model=AttachmentCheckResponse, tags=["attachments"])
+async def attachments_check_post(req: AttachmentCheckRequest) -> AttachmentCheckResponse:
+    return await check_attachments(req)
+
+
+@app.get("/api/v1/attachments/check", response_model=AttachmentCheckResponse, tags=["attachments"])
+async def attachments_check_get(
+    list_url: str = Query(..., description="采购公告列表页 URL"),
+    project_code: str = Query(..., description="项目编号"),
+    timeout: float = Query(10.0, ge=1.0, le=60.0),
+) -> AttachmentCheckResponse:
+    return await check_attachments(
+        AttachmentCheckRequest(list_url=list_url, project_code=project_code, timeout=timeout)
+    )

@@ -1,0 +1,17 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>用户登录 - 某市政府采购网</title>
+</head>
+<body>
+<h1>用户登录</h1>
+<p>下载附件前请先登录。</p>
+<p>（演示样例：附件 URL 返回 200，但实际内容是登录页 HTML，附件检查应判定为不可用。）</p>
+<form method="post" action="/login.html">
+  <p><label>账号 <input name="u"></label></p>
+  <p><label>密码 <input name="p" type="password"></label></p>
+  <button type="submit">登录</button>
+</form>
+</body>
+</html>

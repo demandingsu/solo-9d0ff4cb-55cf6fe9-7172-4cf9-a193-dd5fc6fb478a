@@ -148,6 +148,34 @@ def extract_detail_links(html: str, list_url: str) -> list[tuple[str, str, str]]
     return links
 
 
+# 附件可用性检查支持的附件类型（按 URL 路径扩展名判定，忽略查询串，大小写不敏感）
+_ATTACHMENT_EXTENSIONS = (".pdf", ".zip")
+
+
+def extract_attachment_links(html: str, page_url: str) -> list[tuple[str, str]]:
+    """提取详情页中指向同站点 PDF/ZIP 附件的链接。
+
+    返回 ``(绝对URL, 链接文本)`` 去重列表，保持页面出现顺序。
+    只保留指向本站的附件链接；外站附件（如第三方网盘）不纳入检查。
+    """
+    soup = _soup(html)
+    seen: set[str] = set()
+    links: list[tuple[str, str]] = []
+    for anchor in soup.find_all("a", href=True):
+        absolute = urljoin(page_url, anchor["href"].strip())
+        if not absolute.startswith(("http://", "https://")):
+            continue
+        if not same_site(absolute, page_url):
+            continue  # 只检查指向本站的附件
+        if not urlparse(absolute).path.lower().endswith(_ATTACHMENT_EXTENSIONS):
+            continue
+        if absolute in seen:
+            continue
+        seen.add(absolute)
+        links.append((absolute, _clean(anchor.get_text())))
+    return links
+
+
 # --------------------------------------------------------------------------- #
 # 详情页
 # --------------------------------------------------------------------------- #

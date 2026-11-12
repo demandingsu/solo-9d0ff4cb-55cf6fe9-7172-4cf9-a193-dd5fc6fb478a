@@ -1,8 +1,14 @@
-"""采集编排：列表页发现 → 详情页抓取 → 字段解析 → 业务合并。"""
+"""采集编排：列表页发现 → 详情页抓取 → 字段解析 → 业务合并。
+
+``scan_project`` 是采集与附件检查共用的前置流程：
+列表页发现候选链接 → 并发抓取详情 → 项目归属判定，
+返回属于目标项目的公告（含详情页原始 HTML）与关联失败页面。
+"""
 
 from __future__ import annotations
 
 import asyncio
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
 import httpx
@@ -48,68 +54,93 @@ async def _fetch(client: httpx.AsyncClient, url: str) -> str:
     return response.text
 
 
-async def collect(req: FetchRequest) -> FetchResponse:
-    list_url = str(req.list_url)
-    timeout = httpx.Timeout(req.timeout)
-    async with httpx.AsyncClient(
-        timeout=timeout, headers={"User-Agent": _USER_AGENT}, follow_redirects=True
-    ) as client:
-        # 1) 抓列表页
-        try:
-            list_html = await _fetch(client, list_url)
-        except httpx.HTTPError as exc:
-            raise HTTPException(
-                status_code=502,
-                detail=f"列表页抓取失败：{list_url}（{exc.__class__.__name__}）",
-            ) from exc
+@dataclass
+class ScannedPage:
+    """成功抓取且判定属于目标项目的详情页（保留原始 HTML，供附件提取复用）。"""
 
-        # 2) 发现同站点详情链接（URL, 链接文本, 行上下文）
-        candidates = extract_detail_links(list_html, list_url)
-        if not candidates:
-            return _empty_response(req, warnings=["列表页未发现任何同站点详情链接"])
+    record: NoticeRecord
+    html: str
 
-        target_code = _normalize_code(req.project_code)
-        semaphore = asyncio.Semaphore(_MAX_CONCURRENCY)
 
-        async def fetch_one(url: str, link_text: str, context: str) -> tuple[str, str, str, str]:
-            async with semaphore:
-                try:
-                    html = await _fetch(client, url)
-                    return url, html, link_text, context
-                except httpx.HTTPError:
-                    return url, "", link_text, context  # 空 html 表示失败
+@dataclass
+class FailedPage:
+    """属于目标项目但抓取/解析失败的详情页。"""
 
-        # 3) 并发抓取候选详情页
-        results = await asyncio.gather(*(fetch_one(u, t, c) for u, t, c in candidates))
+    url: str
+    link_text: str
+    reason: str  # 抓取失败 / 解析失败
 
-        notices: list[NoticeRecord] = []
-        failures: list[str] = []
 
-        for url, html, link_text, context in results:
-            # 列表行上下文包含目标项目编号 → 该链接属于本项目（即使详情页抓不回来）
-            row_mentions_project = target_code in _normalize_code(context)
+@dataclass
+class ProjectScan:
+    """``scan_project`` 的输出：本轮采集命中的原公告及更正（含取消）。"""
 
-            if not html:
-                if row_mentions_project:
-                    failures.append(url)
-                continue
+    pages: list[ScannedPage] = field(default_factory=list)
+    failures: list[FailedPage] = field(default_factory=list)
+    candidates: int = 0  # 列表页发现的同站候选详情链接数
+
+
+async def scan_project(
+    client: httpx.AsyncClient, list_url: str, project_code: str
+) -> ProjectScan:
+    """发现并发抓取列表页中属于 ``project_code`` 的同站公告详情页。
+
+    列表页抓取失败直接抛 502；详情页失败不抛出，而是沉淀到
+    ``ProjectScan.failures`` 中，由调用方按业务规则处理（待核实）。
+    """
+    try:
+        list_html = await _fetch(client, list_url)
+    except httpx.HTTPError as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=f"列表页抓取失败：{list_url}（{exc.__class__.__name__}）",
+        ) from exc
+
+    # 发现同站点详情链接（URL, 链接文本, 行上下文）
+    candidates = extract_detail_links(list_html, list_url)
+    if not candidates:
+        return ProjectScan()
+
+    target_code = _normalize_code(project_code)
+    semaphore = asyncio.Semaphore(_MAX_CONCURRENCY)
+
+    async def fetch_one(url: str, link_text: str, context: str) -> tuple[str, str, str, str]:
+        async with semaphore:
             try:
-                data = parse_detail(html, url)
-            except ParseError:
-                if row_mentions_project:
-                    failures.append(url)
-                continue
+                html = await _fetch(client, url)
+                return url, html, link_text, context
+            except httpx.HTTPError:
+                return url, "", link_text, context  # 空 html 表示失败
 
-            if not _code_matches(data.project_code, req.project_code, data.title, context):
-                continue  # 同站点但属于其他项目，忽略
+    results = await asyncio.gather(*(fetch_one(u, t, c) for u, t, c in candidates))
 
-            kind = {
-                "original": NoticeKind.ORIGINAL,
-                "correction": NoticeKind.CORRECTION,
-                "cancellation": NoticeKind.CANCELLATION,
-            }[data.kind_hint]
-            notices.append(
-                NoticeRecord(
+    scan = ProjectScan(candidates=len(candidates))
+    for url, html, link_text, context in results:
+        # 列表行上下文包含目标项目编号 → 该链接属于本项目（即使详情页抓不回来）
+        row_mentions_project = target_code in _normalize_code(context)
+
+        if not html:
+            if row_mentions_project:
+                scan.failures.append(FailedPage(url=url, link_text=link_text, reason="详情页抓取失败"))
+            continue
+        try:
+            data = parse_detail(html, url)
+        except ParseError:
+            if row_mentions_project:
+                scan.failures.append(FailedPage(url=url, link_text=link_text, reason="详情页解析失败"))
+            continue
+
+        if not _code_matches(data.project_code, project_code, data.title, context):
+            continue  # 同站点但属于其他项目，忽略
+
+        kind = {
+            "original": NoticeKind.ORIGINAL,
+            "correction": NoticeKind.CORRECTION,
+            "cancellation": NoticeKind.CANCELLATION,
+        }[data.kind_hint]
+        scan.pages.append(
+            ScannedPage(
+                record=NoticeRecord(
                     url=url,
                     kind=kind,
                     title=data.title,
@@ -117,16 +148,37 @@ async def collect(req: FetchRequest) -> FetchResponse:
                     deadline=data.deadline,
                     cancelled=data.cancelled,
                     cancellation_reason=data.cancellation_reason,
-                )
+                ),
+                html=html,
             )
-            # 缺发布时间在 merger 中按待核实处理。
+        )
+    return scan
 
-    # 4) 业务合并
-    merge_result = merge_notices(
-        MergeInput(notices=notices, failures=sorted(set(failures)))
+
+def build_client(timeout: float, follow_redirects: bool = True) -> httpx.AsyncClient:
+    """构造采集/检查共用的 HTTP 客户端。"""
+    return httpx.AsyncClient(
+        timeout=httpx.Timeout(timeout),
+        headers={"User-Agent": _USER_AGENT},
+        follow_redirects=follow_redirects,
     )
 
-    # 5) 组装来源链接
+
+async def collect(req: FetchRequest) -> FetchResponse:
+    list_url = str(req.list_url)
+    async with build_client(req.timeout) as client:
+        scan = await scan_project(client, list_url, req.project_code)
+
+    if scan.candidates == 0:
+        return _empty_response(req, warnings=["列表页未发现任何同站点详情链接"])
+
+    notices = [page.record for page in scan.pages]
+    failures = sorted({f.url for f in scan.failures})
+
+    # 业务合并
+    merge_result = merge_notices(MergeInput(notices=notices, failures=failures))
+
+    # 组装来源链接
     sources: list[SourceLink] = [
         SourceLink(role="list", url=list_url, title="采购公告列表页")
     ]
@@ -139,7 +191,7 @@ async def collect(req: FetchRequest) -> FetchResponse:
         sources.append(
             SourceLink(role=role_map[notice.kind], url=notice.url, title=notice.title)
         )
-    for failed_url in sorted(set(failures)):
+    for failed_url in failures:
         sources.append(SourceLink(role="failed", url=failed_url, title="抓取失败-待核实"))
 
     return FetchResponse(
